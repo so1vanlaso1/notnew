@@ -1,0 +1,37 @@
+# Reference knobs for the cascade pipeline. run_cascade.py reads its settings
+# from the CLI (this file documents the defaults / intent); copy values onto the
+# command line as needed.
+
+data: Logic_Based_Educational_Queries.json
+
+models:
+  # Two 4B judges that must agree; on disagreement the 8B decides.
+  qwen:        Qwen/Qwen3.5-4B          # judge A + explainer on agreement
+  gemma_small: google/gemma-4-E2B-it    # judge B
+  gemma_big:   google/gemma-4-E4B-it    # the "8B" tiebreaker
+  # If a Gemma repo 404s, use google/gemma-3n-E2B-it / google/gemma-3n-E4B-it.
+
+inference:
+  precision: 4bit        # 4bit | 8bit | bf16  (two 4B in bf16 will NOT fit 12 GB)
+  compute_dtype: bfloat16 # for the 4bit/8bit path; bfloat16 on Blackwell/Ampere
+  device_map: auto
+  max_new_tokens: 256
+  temperature: 0.0       # greedy → reproducible answers (agreement is the "vote")
+
+cascade:
+  # The two 4B judges must produce the SAME canonical answer (a letter for MCQ,
+  # Yes/No/Unknown for the Yes/No/Not-Given type) to count as agreement.
+  # On agreement the explanation comes from Qwen; otherwise from the 8B model.
+  confidence_agree: 0.90
+  confidence_8b:    0.70
+  confidence_qwen_fallback: 0.40   # used only if the 8B can't be loaded/parsed
+
+# VRAM invariant (enforced in code): at any instant either {two 4B models} OR
+# {one 8B model} are resident — never all three.
+
+logging:
+  # Three timestamped files per run, under Result/:
+  #   run_cascade_<stamp>.txt            per-record summary + accuracy
+  #   run_cascade_<stamp>_model_io.txt   every model call, prompt + raw output
+  #   run_cascade_<stamp>.json           machine-readable predictions
+  dir: Result/
