@@ -45,7 +45,7 @@ export QWEN_ID=${QWEN_ID:-Qwen/Qwen3.5-4B}
 export GEMMA_SMALL_ID=${GEMMA_SMALL_ID:-google/gemma-4-E2B-it}
 export GEMMA_BIG_ID=${GEMMA_BIG_ID:-google/gemma-4-E4B-it}
 export LIQUID_ID=${LIQUID_ID:-LiquidAI/LFM2.5-8B-A1B}
-CUDA_WHL=${CUDA_WHL:-cu128}
+export CUDA_WHL=${CUDA_WHL:-cu128}
 
 # 1. GPU sanity check.
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -76,12 +76,43 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-# 4. torch first (right CUDA wheels for Blackwell), then everything else.
+# 4. torch + torchvision first (right CUDA wheels for Blackwell), then the rest.
+# IMPORTANT: install torchvision from the SAME ${CUDA_WHL} channel as torch.
+# requirements.txt pulls timm, which depends on torchvision; if pip is left to
+# resolve torchvision from the default PyPI index it grabs a wheel built for a
+# DIFFERENT CUDA than torch. That mismatch makes transformers' lazy torchvision
+# import fail at model-load time ("PyTorch and torchvision were compiled with
+# different CUDA major versions"), so every model silently fails to load and
+# accuracy comes out 0%. Pinning both to ${CUDA_WHL} here, before
+# requirements.txt, means timm finds a matching torchvision already installed.
 pip install --upgrade pip wheel
-echo "== Installing torch from the ${CUDA_WHL} channel =="
-pip install --index-url "https://download.pytorch.org/whl/${CUDA_WHL}" "torch>=2.7"
+echo "== Installing torch + torchvision from the ${CUDA_WHL} channel =="
+pip install --index-url "https://download.pytorch.org/whl/${CUDA_WHL}" "torch>=2.7" torchvision
 echo "== Installing the rest of requirements.txt =="
 pip install -r requirements.txt
+
+# Guard: if a transitive dep (or a previous broken run) left a torchvision whose
+# CUDA major version doesn't match torch, force it back onto the ${CUDA_WHL}
+# channel. Keeps re-runs idempotent and repairs an already-broken env in place.
+echo "== Verifying torch/torchvision CUDA match =="
+if ! python - <<'PY'
+import re, sys
+try:
+    import torch, torchvision
+except Exception as exc:  # a bad torchvision build can throw on import itself
+    print(f"[warn] torchvision import failed ({exc}); will reinstall.")
+    sys.exit(1)
+m = re.search(r"\+cu(\d+)", torchvision.__version__ or "")
+tv = m.group(1)[:2] if m else ""                       # torchvision CUDA major
+tc = (torch.version.cuda or "").replace(".", "")[:2]   # torch CUDA major
+print(f"torch CUDA={torch.version.cuda}  torchvision={torchvision.__version__}")
+sys.exit(0 if tv and tc and tv == tc else 1)
+PY
+then
+    echo "   mismatch detected — reinstalling torchvision from ${CUDA_WHL}"
+    pip install --index-url "https://download.pytorch.org/whl/${CUDA_WHL}" \
+        --force-reinstall --no-deps torchvision
+fi
 
 # 5. Download the 3 models into the HF cache. Gemma repos are gated → HF_TOKEN.
 echo "== Downloading models (first run can take a while) =="
@@ -116,6 +147,24 @@ if torch.cuda.is_available():
     print(f"GPU      {torch.cuda.get_device_name(0)}  (sm_{cc[0]}{cc[1]})")
 else:
     print("GPU      (none visible to torch)")
+# torchvision must match torch's CUDA major or transformers' lazy import of it
+# crashes every model load (the silent-0% failure). Report it explicitly.
+import re
+try:
+    import torchvision
+    m = re.search(r"\+cu(\d+)", torchvision.__version__ or "")
+    tv = m.group(1)[:2] if m else ""
+    tc = (torch.version.cuda or "").replace(".", "")[:2]
+    ok = bool(tv) and bool(tc) and tv == tc
+    print(f'torchvision {torchvision.__version__}  '
+          f'[{"OK" if ok else "MISMATCH"} vs torch CUDA {torch.version.cuda}]')
+    if not ok:
+        whl = os.environ.get("CUDA_WHL", "cu128")
+        print("[warn] torchvision CUDA != torch CUDA — models will fail to load. Fix:")
+        print(f"         pip install --index-url https://download.pytorch.org/whl/{whl} "
+              f"--force-reinstall --no-deps torchvision")
+except Exception as exc:  # noqa: BLE001
+    print(f"[warn] torchvision import/check failed: {exc}")
 import transformers, accelerate, bitsandbytes
 print(f"transformers {transformers.__version__}  accelerate {accelerate.__version__}  "
       f"bitsandbytes {bitsandbytes.__version__}")

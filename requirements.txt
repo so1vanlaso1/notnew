@@ -20,5 +20,9 @@ huggingface_hub>=0.25      # model download (snapshot_download)
 safetensors>=0.4
 # Gemma 3n / Gemma "4" ship a multimodal stack; these are needed even for the
 # text-only path used here. Harmless for the Qwen text model.
+# NOTE: timm depends on torchvision. Do NOT add torchvision here — this file is
+# installed from the default PyPI index, which ships a torchvision built for a
+# different CUDA than our cu128 torch (→ load-time crash, 0% accuracy). setup.sh
+# installs torchvision from the matching CUDA channel before this file runs.
 timm>=1.0
 pillow>=10.0

@@ -42,6 +42,9 @@ Examples
     # Only the Liquid 8B, with reasoning ("thinking") turned on:
     python run_cascade.py --stages liquid8b --precision bf16 --think --show-gold
 
+    # Run a specific index window — questions 100..199 of the (filtered) set:
+    python run_cascade.py --stages 4b,gemma8b --precision 4bit --start 100 --end 200 --show-gold
+
     # No-GPU wiring smoke test (fake models, exercises every stage + logging):
     python run_cascade.py --backend stub --stages 4b,gemma8b,liquid8b --show-gold --limit 8
 """
@@ -178,7 +181,11 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=256,
                     help="answer budget; auto-raised for thinking / always-reasoning models")
     ap.add_argument("--limit", type=int, default=0, help="process only the first N questions (0 = all)")
-    ap.add_argument("--start", type=int, default=0, help="skip the first N questions")
+    ap.add_argument("--start", type=int, default=0,
+                    help="first index to run (inclusive), over the post---only set")
+    ap.add_argument("--end", type=int, default=0,
+                    help="stop BEFORE this index (exclusive); 0 = run to the end. "
+                         "Pair with --start to run a window: --start 100 --end 200")
     ap.add_argument("--only", choices=["ynn", "mcq", "all"], default="all")
     ap.add_argument("--show-gold", action="store_true", help="score against the gold answers")
     ap.add_argument("--out", type=Path, default=None, help="extra path to also write predictions JSON")
@@ -193,7 +200,15 @@ def main() -> None:
         gated = [g for g in gated if g[0].answer_type == AnswerType.YES_NO_UNKNOWN]
     elif args.only == "mcq":
         gated = [g for g in gated if g[0].answer_type == AnswerType.MCQ]
-    gated = gated[args.start:]
+    # Index window over the filtered set: process [start, end). --limit further
+    # caps the window (process at most N of it). All indices are positions in the
+    # post-(--only)-filter list, matching --start's existing meaning.
+    n_filtered = len(gated)
+    lo = max(0, args.start)
+    hi = args.end if args.end > 0 else n_filtered
+    if args.end and args.end <= lo:
+        ap.error(f"--end ({args.end}) must be greater than --start ({lo})")
+    gated = gated[lo:hi]
     if args.limit:
         gated = gated[: args.limit]
     records = [g[0] for g in gated]
@@ -203,6 +218,8 @@ def main() -> None:
     print(f"[info] loaded {len(records_all)} questions; processing {len(records)} "
           f"({sum(1 for r in records if r.answer_type == AnswerType.MCQ)} MCQ / "
           f"{sum(1 for r in records if r.answer_type == AnswerType.YES_NO_UNKNOWN)} YNN)")
+    print(f"[info] index window: [{lo}, {min(hi, n_filtered)}) of {n_filtered} after --only"
+          + (f"; capped to first {args.limit}" if args.limit else ""))
     print(f"[info] backend={args.backend}  precision={args.precision}  think={args.think}")
     print(f"[info] stages={stages}  weights: 4B={args.weight_4b}  8B={args.weight_8b}")
     for st in stages:
