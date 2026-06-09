@@ -47,6 +47,11 @@ class ModelReply:
     answer_display: str     # human readable, e.g. "A. Sophia qualifies…"
     explanation: str
     elapsed_s: float = 0.0
+    # Soft-vote bookkeeping: the weight this model contributes to its label, and
+    # its size class ("4b" → 1.0, "8b" → 1.5 by default). Set from the model when
+    # the reply is produced (see cascade.query).
+    weight: float = 1.0
+    model_class: str = "4b"
 
 
 @dataclass
@@ -57,8 +62,9 @@ class FinalAnswer:
     answer_display: str
     explanation: str
     decider: str               # which path produced it (see cascade.DECIDER_*)
-    agreed: bool               # did the two 4B judges agree?
-    confidence: float
+    agreed: bool               # True iff every model that voted picked this label
+    confidence: float          # winning weight / total weight (the vote margin)
     replies: list[ModelReply] = field(default_factory=list)
+    scores: dict[str, float] = field(default_factory=dict)  # label → summed weight
     gold: str | None = None    # only set when --show-gold
     elapsed_s: float = 0.0

@@ -113,15 +113,19 @@ def _classify(gold: str | None, options: list[str] | None) -> AnswerType:
 
 
 def _record_id(raw_idx: Any, record_pos: int, q_pos: int) -> str:
+    # `idx` in this dataset is the list of premise indices a question uses, NOT a
+    # unique key — the same idx recurs across source objects. So always prefix the
+    # source object position to guarantee globally unique ids (otherwise records
+    # from different objects would collide and share one prediction slot).
+    base = ""
     if isinstance(raw_idx, list):
         flat: list[str] = []
         for sub in raw_idx:
             flat.extend(str(x) for x in sub) if isinstance(sub, list) else flat.append(str(sub))
-        if flat:
-            return f"{'-'.join(flat)}_q{q_pos}"
-    if isinstance(raw_idx, (str, int)):
-        return f"{raw_idx}_q{q_pos}"
-    return f"rec{record_pos}_q{q_pos}"
+        base = "-".join(flat)
+    elif isinstance(raw_idx, (str, int)):
+        base = str(raw_idx)
+    return f"r{record_pos}_{base}_q{q_pos}" if base else f"r{record_pos}_q{q_pos}"
 
 
 def expand_record(obj: dict[str, Any], record_pos: int) -> list[Record]:

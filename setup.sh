@@ -22,12 +22,16 @@
 # Overridable env vars (defaults are the repo ids the pipeline ships with):
 #   QWEN_ID        4B judge A            (default: Qwen/Qwen3.5-4B)
 #   GEMMA_SMALL_ID 4B judge B            (default: google/gemma-4-E2B-it)
-#   GEMMA_BIG_ID   8B tiebreaker         (default: google/gemma-4-E4B-it)
+#   GEMMA_BIG_ID   Gemma 8B              (default: google/gemma-4-E4B-it)
+#   LIQUID_ID      Liquid 8B (MoE)       (default: LiquidAI/LFM2.5-8B-A1B)
 #   CUDA_WHL       torch wheel channel   (default: cu128; use cu126/cu121 on older drivers)
 #   HF_TOKEN       HF access token (required for the gated Gemma repos)
 #
 # If a Gemma download 404s, the current equivalents are google/gemma-3n-E2B-it
 # and google/gemma-3n-E4B-it — re-run with GEMMA_SMALL_ID/GEMMA_BIG_ID set to those.
+# NOTE: LiquidAI/LFM2.5-8B-A1B needs transformers>=5.0 (pinned in requirements.txt);
+# it is NOT gated. You only need all four models if you run all three stages —
+# download just the ones for the --stages you intend to use.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -40,6 +44,7 @@ export PYTHONUTF8=1
 export QWEN_ID=${QWEN_ID:-Qwen/Qwen3.5-4B}
 export GEMMA_SMALL_ID=${GEMMA_SMALL_ID:-google/gemma-4-E2B-it}
 export GEMMA_BIG_ID=${GEMMA_BIG_ID:-google/gemma-4-E4B-it}
+export LIQUID_ID=${LIQUID_ID:-LiquidAI/LFM2.5-8B-A1B}
 CUDA_WHL=${CUDA_WHL:-cu128}
 
 # 1. GPU sanity check.
@@ -88,7 +93,8 @@ fi
 python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
-ids = [os.environ["QWEN_ID"], os.environ["GEMMA_SMALL_ID"], os.environ["GEMMA_BIG_ID"]]
+ids = [os.environ["QWEN_ID"], os.environ["GEMMA_SMALL_ID"],
+       os.environ["GEMMA_BIG_ID"], os.environ["LIQUID_ID"]]
 token = os.environ.get("HF_TOKEN") or None
 for mid in ids:
     try:
@@ -114,7 +120,8 @@ import transformers, accelerate, bitsandbytes
 print(f"transformers {transformers.__version__}  accelerate {accelerate.__version__}  "
       f"bitsandbytes {bitsandbytes.__version__}")
 from transformers import AutoConfig
-for mid in (os.environ["QWEN_ID"], os.environ["GEMMA_SMALL_ID"], os.environ["GEMMA_BIG_ID"]):
+for mid in (os.environ["QWEN_ID"], os.environ["GEMMA_SMALL_ID"],
+            os.environ["GEMMA_BIG_ID"], os.environ["LIQUID_ID"]):
     try:
         cfg = AutoConfig.from_pretrained(mid, trust_remote_code=True)
         print(f'model    {mid}  (model_type={getattr(cfg, "model_type", "?")})  OK')
@@ -126,5 +133,6 @@ PY
 
 echo
 echo "Environment ready. Try:"
-echo "  python run_cascade.py --backend stub --show-gold --limit 8   # no-GPU wiring test"
-echo "  python run_cascade.py --precision 4bit --show-gold --limit 20 # real run"
+echo "  python run_cascade.py --backend stub --stages 4b,gemma8b,liquid8b --show-gold --limit 8  # no-GPU wiring test"
+echo "  python run_cascade.py --stages 4b,gemma8b --precision 4bit --show-gold --limit 20         # 4B judges + Gemma 8B"
+echo "  python run_cascade.py --stages 4b,gemma8b,liquid8b --precision 4bit --show-gold            # all three stages"

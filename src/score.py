@@ -31,17 +31,17 @@ class TypeStats:
 class Report:
     overall: TypeStats = field(default_factory=TypeStats)
     by_type: dict[str, TypeStats] = field(default_factory=dict)
-    agreed: int = 0
-    escalated: int = 0
+    unanimous: int = 0   # every voting model picked the winning label
+    split: int = 0       # the weighted vote had to break a disagreement
 
-    def add(self, atype: AnswerType, correct: bool, agreed: bool) -> None:
+    def add(self, atype: AnswerType, correct: bool, unanimous: bool) -> None:
         self.overall.total += 1
         self.overall.correct += int(correct)
         slot = self.by_type.setdefault(atype.value, TypeStats())
         slot.total += 1
         slot.correct += int(correct)
-        self.agreed += int(agreed)
-        self.escalated += int(not agreed)
+        self.unanimous += int(unanimous)
+        self.split += int(not unanimous)
 
     def to_dict(self) -> dict:
         return {
@@ -49,17 +49,17 @@ class Report:
                         "accuracy": self.overall.accuracy},
             "by_type": {k: {"total": v.total, "correct": v.correct, "accuracy": v.accuracy}
                         for k, v in self.by_type.items()},
-            "agreed": self.agreed,
-            "escalated_to_8b": self.escalated,
+            "unanimous": self.unanimous,
+            "split_vote": self.split,
         }
 
 
-def score(records: list[Record], finals: dict[str, FinalAnswer]) -> Report:
+def score(records: list[Record], finals: list[FinalAnswer]) -> Report:
+    """`finals` is aligned to `records` by position (finals[i] scores records[i])."""
     rep = Report()
-    for r in records:
-        f = finals.get(r.id)
+    for r, f in zip(records, finals):
         if f is None:
-            rep.add(r.answer_type, correct=False, agreed=False)
+            rep.add(r.answer_type, correct=False, unanimous=False)
             continue
         rep.add(r.answer_type, is_correct(f.answer, r.answer), f.agreed)
     return rep

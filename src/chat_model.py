@@ -30,6 +30,9 @@ class ChatModel:
         compute_dtype: str = "bfloat16",
         enable_thinking: bool = False,
         label: str = "",
+        vote_weight: float = 1.0,
+        model_class: str = "4b",
+        always_cot: bool = False,
     ):
         import torch  # lazy: keep the package importable without torch
         from transformers import AutoTokenizer
@@ -38,6 +41,12 @@ class ChatModel:
         self.model_id = model_id
         self.label = label or model_id
         self.enable_thinking = enable_thinking
+        # Soft-vote metadata, copied onto every ModelReply (see cascade.query).
+        self.vote_weight = vote_weight
+        self.model_class = model_class
+        # Models that always emit a chain of thought (e.g. LFM2.5) need more room
+        # before the ANSWER line appears — the caller bumps max_new_tokens for them.
+        self.always_cot = always_cot
 
         if precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
@@ -175,11 +184,15 @@ class StubModel:
     drive both the agreement and the disagreement branch without a GPU.
     """
 
-    def __init__(self, label: str, answer_fn):
+    def __init__(self, label: str, answer_fn, vote_weight: float = 1.0,
+                 model_class: str = "4b", always_cot: bool = False):
         self.label = label
         self.model_id = f"stub:{label}"
         self.precision = "stub"
         self._answer_fn = answer_fn
+        self.vote_weight = vote_weight
+        self.model_class = model_class
+        self.always_cot = always_cot
 
     def generate(self, system: str, user: str, max_new_tokens: int = 256,
                  temperature: float = 0.0) -> tuple[str, str, float]:

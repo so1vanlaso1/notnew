@@ -10,7 +10,8 @@ tqdm>=4.66
 
 # Model inference (GPU).
 torch>=2.7                 # cu128 wheels for Blackwell sm_120 (RTX 5070)
-transformers>=4.57         # Qwen3.5 + Gemma (3n/4) architecture support
+transformers>=5.0          # LFM2.5 (liquid8b) needs >=5.0; also covers Qwen3.5 + Gemma 3n/4.
+                           # If you only run the 4b/gemma8b stages, transformers>=4.57 is enough.
 accelerate>=1.1            # device_map="auto" sharding / offload
 bitsandbytes>=0.44         # 4-bit (NF4) and 8-bit (int8) quantization
 sentencepiece>=0.2         # Gemma tokenizer

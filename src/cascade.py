@@ -1,14 +1,20 @@
-"""The cascade decision logic.
+"""The cascade decision logic — weighted soft voting across stages.
 
-Per record:
-  1. Both 4B judges answer (Qwen3.5-4B and Gemma-E2B).
-  2. If their canonical answers AGREE → that is the final answer, and Qwen's
-     own explanation is used.
-  3. If they DISAGREE → the record is deferred; later the 8B model (Gemma-E4B)
-     decides and explains.
+Every selected model answers every record (the 8B model is no longer fired only
+on disagreement — it votes on every question). Each model contributes a weight to
+the label it picked; the label with the most total weight wins:
 
-The VRAM invariant (≤ two 4B models OR one 8B model) is enforced by the caller
-(`run_cascade.py`), which loads/unloads in phases. This module is pure logic.
+    4B judge  → weight 1.0      (Qwen3.5-4B, Gemma-E2B)
+    8B model  → weight 1.5      (Gemma-E4B, LFM2.5-8B-A1B)
+
+So a single 8B (1.5) outvotes one disagreeing 4B (1.0), but two agreeing 4B
+judges (2.0) outvote a lone 8B (1.5). Confidence is the winning vote's share of
+the total weight, and the explanation is taken from the strongest model that
+voted for the winning label (an 8B's reasoning wins over a 4B's).
+
+The VRAM invariant (≤ two 4B models OR one 8B model resident) is enforced by the
+caller (`run_cascade.py`), which loads/runs/unloads one stage at a time. This
+module is pure logic.
 """
 
 from __future__ import annotations
@@ -16,15 +22,15 @@ from __future__ import annotations
 from schema import FinalAnswer, ModelReply, Record
 from prompts import build_user, parse_reply, system_for
 
-DECIDER_AGREE = "agreement(4B Qwen+Gemma-E2B)"
-DECIDER_BIG = "fallback(8B Gemma-E4B)"
-DECIDER_BIG_UNAVAILABLE = "fallback unavailable -> Qwen-4B"
-DECIDER_NONE = "no answer"
+# Default vote weights by model size class.
+WEIGHT_4B = 1.0
+WEIGHT_8B = 1.5
 
-CONF_AGREE = 0.90
-CONF_BIG = 0.70
-CONF_QWEN_ONLY = 0.40
-CONF_NONE = 0.0
+DECIDER_UNANIMOUS = "unanimous vote"
+DECIDER_VOTE = "weighted vote"
+DECIDER_NONE = "no parseable answer"
+
+_EPS = 1e-9
 
 
 def query(model, record: Record, max_new_tokens: int = 256) -> ModelReply:
@@ -32,7 +38,7 @@ def query(model, record: Record, max_new_tokens: int = 256) -> ModelReply:
 
     Never raises: a generation failure becomes a ModelReply with answer=None and
     the error captured in `raw` (so it still shows up in the model-I/O log, and
-    the record simply escalates instead of aborting the whole batch)."""
+    the record simply gets one fewer vote instead of aborting the whole batch)."""
     system = system_for(record)
     user = build_user(record)
     # Render the prompt up front so it is logged even if generation throws.
@@ -57,86 +63,84 @@ def query(model, record: Record, max_new_tokens: int = 256) -> ModelReply:
         answer_display=display or (canon or ""),
         explanation=why,
         elapsed_s=elapsed,
+        weight=float(getattr(model, "vote_weight", WEIGHT_4B)),
+        model_class=getattr(model, "model_class", "4b"),
     )
 
 
-def judges_agree(a: ModelReply, b: ModelReply) -> bool:
-    """Two judges agree only when both produced the SAME, non-empty canonical
-    answer. If either failed to produce a parseable answer, they do not agree
-    (so the record escalates to the 8B model)."""
-    return a.answer is not None and a.answer == b.answer
+# ── Weighted soft vote ────────────────────────────────────────────────────────
+def tally(replies: list[ModelReply]) -> dict[str, float]:
+    """Sum each model's weight onto the label it voted for (None votes abstain)."""
+    scores: dict[str, float] = {}
+    for r in replies:
+        if r.answer is None:
+            continue
+        scores[r.answer] = scores.get(r.answer, 0.0) + r.weight
+    return scores
 
 
-def finalize_agreed(record: Record, qwen: ModelReply, gemma: ModelReply) -> FinalAnswer:
-    """Both 4B judges agreed → keep the answer; explanation comes from Qwen."""
-    return FinalAnswer(
-        id=record.id,
-        answer_type=record.answer_type,
-        answer=qwen.answer,
-        answer_display=qwen.answer_display,
-        explanation=qwen.explanation,
-        decider=DECIDER_AGREE,
-        agreed=True,
-        confidence=CONF_AGREE,
-        replies=[qwen, gemma],
-        elapsed_s=qwen.elapsed_s + gemma.elapsed_s,
+def _break_tie(winners: list[str], replies: list[ModelReply]) -> str:
+    """Tied total weight → defer to the single strongest individual vote; if
+    still tied, to the latest stage that voted for it (more authoritative). For a
+    pure 2×4B split (1.0 vs 1.0) this resolves to the later judge."""
+    best_label, best_key = winners[0], None
+    for idx, r in enumerate(replies):
+        if r.answer in winners:
+            key = (r.weight, idx)  # higher weight first, then later in the run
+            if best_key is None or key > best_key:
+                best_key, best_label = key, r.answer
+    return best_label
+
+
+def _pick_explainer(label: str, replies: list[ModelReply]) -> ModelReply | None:
+    """The explanation for the final answer comes from the strongest model that
+    voted for `label` and actually wrote a WHY; falls back to the strongest such
+    model even if its WHY is empty."""
+    voters = [r for r in replies if r.answer == label]
+    if not voters:
+        return None
+    # Highest weight first, then later stage (an 8B's reasoning beats a 4B's).
+    voters_ranked = sorted(
+        range(len(voters)), key=lambda i: (voters[i].weight, i), reverse=True
     )
+    for i in voters_ranked:
+        if voters[i].explanation.strip():
+            return voters[i]
+    return voters[voters_ranked[0]]
 
 
-def finalize_with_big(record: Record, qwen: ModelReply, gemma: ModelReply,
-                      big: ModelReply) -> FinalAnswer:
-    """Judges disagreed → the 8B model decides AND explains."""
-    if big.answer is not None:
-        answer, display, expl, decider, conf = (
-            big.answer, big.answer_display, big.explanation, DECIDER_BIG, CONF_BIG
+def finalize_by_vote(record: Record, replies: list[ModelReply]) -> FinalAnswer:
+    """Combine every model's vote on one record into the final answer."""
+    scores = tally(replies)
+    elapsed = sum(r.elapsed_s for r in replies)
+    if not scores:
+        # Nobody produced a parseable answer.
+        return FinalAnswer(
+            id=record.id, answer_type=record.answer_type, answer=None,
+            answer_display="", explanation="", decider=DECIDER_NONE,
+            agreed=False, confidence=0.0, replies=replies, scores=scores,
+            elapsed_s=elapsed,
         )
-    else:
-        # 8B produced nothing parseable — fall back to Qwen's stored answer.
-        answer, display, expl, decider, conf = (
-            qwen.answer, qwen.answer_display, qwen.explanation,
-            DECIDER_BIG_UNAVAILABLE, CONF_QWEN_ONLY,
-        )
+
+    total = sum(scores.values())
+    best = max(scores.values())
+    winners = [lbl for lbl, w in scores.items() if abs(w - best) < _EPS]
+    win = winners[0] if len(winners) == 1 else _break_tie(winners, replies)
+
+    voters = [r for r in replies if r.answer is not None]
+    unanimous = len(scores) == 1 and len(voters) == len(replies)
+    explainer = _pick_explainer(win, replies)
+
     return FinalAnswer(
         id=record.id,
         answer_type=record.answer_type,
-        answer=answer,
-        answer_display=display or (answer or ""),
-        explanation=expl,
-        decider=decider,
-        agreed=False,
-        confidence=conf if answer is not None else CONF_NONE,
-        replies=[qwen, gemma, big],
-        elapsed_s=qwen.elapsed_s + gemma.elapsed_s + big.elapsed_s,
-    )
-
-
-def finalize_big_unloadable(
-    record: Record, qwen: ModelReply, gemma: ModelReply,
-    big_model_id: str = "", load_error: str | None = None,
-) -> FinalAnswer:
-    """The 8B model could not be loaded at all — keep Qwen's stored answer so the
-    record still gets a (lower-confidence) prediction instead of being dropped.
-
-    A synthetic 8B reply recording the load failure is appended so the attempt is
-    still visible in the model-I/O log ("log everything")."""
-    replies = [qwen, gemma]
-    if load_error is not None:
-        replies.append(ModelReply(
-            model_label="Gemma-E4B(8B)",
-            model_id=big_model_id,
-            prompt="<8B escalation attempted — the two 4B judges disagreed>",
-            raw=f"<8B model could not be loaded: {load_error}>",
-            answer=None, answer_display="", explanation="", elapsed_s=0.0,
-        ))
-    return FinalAnswer(
-        id=record.id,
-        answer_type=record.answer_type,
-        answer=qwen.answer,
-        answer_display=qwen.answer_display,
-        explanation=qwen.explanation,
-        decider=DECIDER_BIG_UNAVAILABLE,
-        agreed=False,
-        confidence=CONF_QWEN_ONLY if qwen.answer is not None else CONF_NONE,
+        answer=win,
+        answer_display=(explainer.answer_display if explainer else win),
+        explanation=(explainer.explanation if explainer else ""),
+        decider=DECIDER_UNANIMOUS if unanimous else DECIDER_VOTE,
+        agreed=unanimous,
+        confidence=best / total if total else 0.0,
         replies=replies,
-        elapsed_s=qwen.elapsed_s + gemma.elapsed_s,
+        scores=scores,
+        elapsed_s=elapsed,
     )

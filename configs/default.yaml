@@ -5,33 +5,49 @@
 data: Logic_Based_Educational_Queries.json
 
 models:
-  # Two 4B judges that must agree; on disagreement the 8B decides.
-  qwen:        Qwen/Qwen3.5-4B          # judge A + explainer on agreement
-  gemma_small: google/gemma-4-E2B-it    # judge B
-  gemma_big:   google/gemma-4-E4B-it    # the "8B" tiebreaker
+  # Every selected model votes on every record; the 8B models are no longer fired
+  # only on disagreement.
+  qwen:        Qwen/Qwen3.5-4B           # stage "4b" judge A      (weight 1.0)
+  gemma_small: google/gemma-4-E2B-it     # stage "4b" judge B      (weight 1.0)
+  gemma_big:   google/gemma-4-E4B-it     # stage "gemma8b"         (weight 1.5)
+  liquid:      LiquidAI/LFM2.5-8B-A1B    # stage "liquid8b" (MoE)  (weight 1.5)
   # If a Gemma repo 404s, use google/gemma-3n-E2B-it / google/gemma-3n-E4B-it.
+  # LFM2.5 needs transformers>=5.0 and always emits a short chain of thought.
+
+stages:
+  # Pick any comma-combination of {4b, gemma8b, liquid8b} on the CLI:
+  #   --stages 4b                     just the two 4B judges
+  #   --stages gemma8b                only the Gemma 8B
+  #   --stages liquid8b               only the Liquid 8B
+  #   --stages 4b,gemma8b             4B judges + Gemma 8B  (the "call 8B every run" setup)
+  #   --stages 4b,gemma8b,liquid8b    all three (default)
+  select: 4b,gemma8b,liquid8b
+  # Stages run ONE AT A TIME: each stage's model(s) load, vote on every record,
+  # then are freed before the next stage loads. So at most {two 4B models} OR
+  # {one 8B model} are resident at once — the 12 GB VRAM invariant.
+
+vote:
+  # Weighted soft vote: each model adds its weight to the label it chose; the
+  # label with the most total weight wins. Confidence = winning weight / total.
+  weight_4b: 1.0
+  weight_8b: 1.5          # 8B vote is 1.5x a 4B vote (--weight-4b / --weight-8b)
+  # Ties (equal total weight) break toward the strongest single vote, then the
+  # latest stage. A pure 2x4B split therefore resolves to judge B.
 
 inference:
-  precision: 4bit        # 4bit | 8bit | bf16  (two 4B in bf16 will NOT fit 12 GB)
+  precision: 4bit         # 4bit | 8bit | bf16  (two 4B in bf16 will NOT fit 12 GB)
   compute_dtype: bfloat16 # for the 4bit/8bit path; bfloat16 on Blackwell/Ampere
   device_map: auto
-  max_new_tokens: 256
-  temperature: 0.0       # greedy → reproducible answers (agreement is the "vote")
-
-cascade:
-  # The two 4B judges must produce the SAME canonical answer (a letter for MCQ,
-  # Yes/No/Unknown for the Yes/No/Not-Given type) to count as agreement.
-  # On agreement the explanation comes from Qwen; otherwise from the 8B model.
-  confidence_agree: 0.90
-  confidence_8b:    0.70
-  confidence_qwen_fallback: 0.40   # used only if the 8B can't be loaded/parsed
-
-# VRAM invariant (enforced in code): at any instant either {two 4B models} OR
-# {one 8B model} are resident — never all three.
+  max_new_tokens: 256     # auto-raised to >=768 for --think and the always-CoT Liquid
+  temperature: 0.0        # greedy → reproducible answers (the "vote" is across models)
+  think: false            # --think: Qwen reasons in <think>…</think>; Gemma ignores it;
+                          #          Liquid always reasons. <think> blocks are stripped
+                          #          before the ANSWER is parsed.
 
 logging:
   # Three timestamped files per run, under Result/:
-  #   run_cascade_<stamp>.txt            per-record summary + accuracy
+  #   run_cascade_<stamp>.txt            per-record summary: every vote + weighted
+  #                                      tally + winner + confidence + accuracy
   #   run_cascade_<stamp>_model_io.txt   every model call, prompt + raw output
-  #   run_cascade_<stamp>.json           machine-readable predictions
+  #   run_cascade_<stamp>.json           machine-readable predictions (incl. scores)
   dir: Result/
