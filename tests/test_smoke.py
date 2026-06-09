@@ -142,6 +142,32 @@ def test_strip_thinking_handles_unclosed_close_tag():
     assert "reasoning" not in strip_thinking("reasoning here</think> ANSWER: Yes").lower()
 
 
+def test_why_ignores_reasoning_before_the_answer():
+    # Repro of the live bug: thinking-mode reasoning preceded the ANSWER and there
+    # was no WHY line, so the explanation must NOT pick up the reasoning prose.
+    rec = Record(id="m", premises_nl=["p"], question_nl="Which?",
+                 answer_type=AnswerType.MCQ, options=["x", "y"])
+    raw = "thought The user wants me to act as a strict logic examiner and pick.\nANSWER: A"
+    canon, _disp, why = parse_reply(raw, rec)
+    assert canon == "A"
+    assert "thought" not in why.lower() and "wants me to act" not in why.lower()
+
+
+def test_why_comes_from_after_answer_when_reasoning_precedes_it():
+    rec = _ynn()
+    raw = "Let me think. The premises say cats are animals.\nANSWER: Yes\nWHY: premise 1 states it."
+    canon, _disp, why = parse_reply(raw, rec)
+    assert canon == "Yes"
+    assert "premise 1" in why and "Let me think" not in why
+
+
+def test_strip_thinking_handles_gemma_thought_tags():
+    raw = "<start_of_thought>maybe No<end_of_thought>\nANSWER: Yes WHY: by premise 1."
+    rec = _ynn()
+    canon, _disp, why = parse_reply(raw, rec)
+    assert canon == "Yes" and "maybe No" not in why
+
+
 # ── weighted soft vote ────────────────────────────────────────────────────────
 def test_weights_defaults():
     assert WEIGHT_4B == 1.0 and WEIGHT_8B == 1.5

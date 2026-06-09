@@ -94,6 +94,13 @@ One switch, applied to every model: `--precision {4bit,8bit,bf16}`.
 > ⚠️ Two 4B models in **bf16** will not fit a 12 GB card. Use **4bit** (≈5–6 GB
 > for both judges) or **8bit** there. bf16 is fine if you have the headroom.
 
+On a **single GPU**, the loader pins each model fully to GPU 0 (it does **not**
+let `device_map="auto"` offload to CPU/disk, which would otherwise make
+bitsandbytes int8 refuse to load an 8B model that actually fits). If a model is
+genuinely too big it OOMs cleanly and that stage is skipped. The Liquid 8B MoE
+fits at **8bit** (~8–9 GB) or **4bit** (~4.5 GB) on a 12 GB card — drop to 4bit
+if 8bit is tight because other processes hold VRAM.
+
 ## Setup
 
 ```bash

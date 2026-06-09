@@ -248,22 +248,27 @@ _ANSWER_LINE = re.compile(r"ANSWER\s*[:\-=]\s*(.+)", re.IGNORECASE)
 _WHY_LINE = re.compile(r"WHY\s*[:\-=]\s*(.+)", re.IGNORECASE | re.DOTALL)
 _WHY_INLINE = re.compile(r"\bWHY\b\s*[:\-=]", re.IGNORECASE)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
-# Thinking-mode / chain-of-thought stripping. Qwen wraps its reasoning in
-# <think>…</think>; some templates emit only the closing tag. LFM2.5 reasons in
-# prose with no tags — there the ANSWER:/WHY: search below still recovers the
-# verdict, so no special handling is needed.
-_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
-_THINK_CLOSE = re.compile(r"^.*?</think>", re.IGNORECASE | re.DOTALL)
+# Thinking-mode / chain-of-thought stripping. Models tag reasoning differently —
+# Qwen uses <think>…</think>, Gemma can use <start_of_thought>…<end_of_thought>,
+# others <thinking>…</thinking>; some emit only the closing tag. LFM2.5 reasons
+# in prose with no tags. Whatever the model does, the real guard against reasoning
+# leaking into the WHY is parse_reply only reading text AFTER the ANSWER line.
+_THINK_BLOCK = re.compile(
+    r"<think>.*?</think>|<thinking>.*?</thinking>|<start_of_thought>.*?<end_of_thought>",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINK_CLOSE = re.compile(r"^.*?(?:</think>|</thinking>|<end_of_thought>)", re.IGNORECASE | re.DOTALL)
+_THINK_TAGS = re.compile(r"</?think>|</?thinking>|</?start_of_thought>|</?end_of_thought>", re.IGNORECASE)
 
 
 def strip_thinking(raw: str) -> str:
-    """Remove a <think>…</think> reasoning block so it can't leak into the parsed
-    answer or the WHY fallback. The verbatim `raw` is kept for the logs; only the
-    parsing copy is cleaned."""
+    """Remove a closed reasoning block so it can't leak into the parsed answer.
+    The verbatim `raw` is kept for the logs; only the parsing copy is cleaned."""
     raw = _THINK_BLOCK.sub(" ", raw or "")
-    if "</think>" in raw.lower():
+    low = raw.lower()
+    if "</think>" in low or "</thinking>" in low or "<end_of_thought>" in low:
         raw = _THINK_CLOSE.sub(" ", raw)
-    return raw.replace("<think>", " ")
+    return _THINK_TAGS.sub(" ", raw)
 
 
 def compact_why(text: str, max_chars: int = 240) -> str:
@@ -296,23 +301,27 @@ def _scavenge_answer(raw: str, record: Record) -> tuple[str | None, str]:
 def parse_reply(raw: str, record: Record) -> tuple[str | None, str, str]:
     """Return (canonical_answer, display, compact_explanation)."""
     clean = strip_thinking(raw or "")
-    ans_token = None
     m = _ANSWER_LINE.search(clean)
+    ans_token, inline_why = None, ""
     if m:
-        ans_token = m.group(1).strip().splitlines()[0].strip()
-        # "ANSWER: Yes WHY: …" on one line — keep only the answer part.
-        ans_token = _WHY_INLINE.split(ans_token, maxsplit=1)[0].strip()
+        ans_line = m.group(1).strip().splitlines()[0].strip()
+        # "ANSWER: Yes WHY: …" on one line — split the answer from the inline WHY.
+        parts = _WHY_INLINE.split(ans_line, maxsplit=1)
+        ans_token = parts[0].strip()
+        if len(parts) > 1:
+            inline_why = parts[1].strip()
 
     canon, display = canonicalize(ans_token, record) if ans_token else (None, "")
     if canon is None:
         canon, display = _scavenge_answer(clean, record)
 
-    why = ""
-    mw = _WHY_LINE.search(clean)
-    if mw:
-        why = compact_why(mw.group(1))
-    if not why:
-        # Strip any ANSWER line and use the remaining prose as the explanation.
-        body = _ANSWER_LINE.sub("", clean)
-        why = compact_why(body)
+    # WHY: prefer the inline WHY on the ANSWER line, then a WHY: line AFTER the
+    # answer, then the prose AFTER the answer. NEVER the text before the answer —
+    # in thinking mode that prose is the model's reasoning, not its explanation.
+    after = clean[m.end():] if m else clean
+    if inline_why:
+        why = compact_why(inline_why)
+    else:
+        mw = _WHY_LINE.search(after)
+        why = compact_why(mw.group(1) if mw else after)
     return canon, (display or (canon or "")), why

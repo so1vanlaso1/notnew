@@ -92,26 +92,50 @@ class ChatModel:
         elif precision == "fp32":
             load_dtype = torch.float32
 
-        self.model = self._load_model(
-            model_id, load_dtype, device_map if has_cuda else "cpu", quant
-        )
+        # Device placement. On a SINGLE CUDA GPU, "auto" makes accelerate keep a
+        # memory margin and can spuriously offload a model that WOULD fit (e.g. an
+        # 8B MoE at 8-bit on a 12 GB card) to CPU/disk — which bitsandbytes int8
+        # then refuses to load. Pin the whole model to GPU 0 instead; a genuinely
+        # over-budget load then OOMs honestly rather than silently offloading.
+        # Multi-GPU "auto" and any explicit device_map are left untouched.
+        if not has_cuda:
+            resolved_device_map = "cpu"
+        elif device_map == "auto" and torch.cuda.device_count() == 1:
+            resolved_device_map = {"": 0}
+        else:
+            resolved_device_map = device_map
+
+        self.model = self._load_model(model_id, load_dtype, resolved_device_map, quant)
         self.model.eval()
         log.info("loaded %s (%s, precision=%s)", self.label, model_id, self.precision)
 
     def _load_model(self, model_id: str, dtype, device_map, quant):
-        # `torch_dtype` is ignored by transformers when a quantization_config is
-        # present, so passing both is safe.
-        kwargs = dict(trust_remote_code=True, torch_dtype=dtype, device_map=device_map)
-        if quant is not None:
-            kwargs["quantization_config"] = quant
         from transformers import AutoModelForCausalLM
+
+        def _from(cls):
+            kwargs = dict(trust_remote_code=True, device_map=device_map)
+            if quant is not None:
+                kwargs["quantization_config"] = quant
+            # transformers>=5 renamed torch_dtype→dtype; fall back for older versions.
+            try:
+                return cls.from_pretrained(model_id, dtype=dtype, **kwargs)
+            except TypeError:
+                return cls.from_pretrained(model_id, torch_dtype=dtype, **kwargs)
+
         try:
-            return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+            return _from(AutoModelForCausalLM)
         except Exception as e:  # noqa: BLE001
-            log.warning("%s: AutoModelForCausalLM failed (%s); trying AutoModelForImageTextToText.",
-                        self.label, e)
+            # Only retry as image-text-to-text when the failure is an ARCHITECTURE
+            # mismatch (some Gemma multimodal repos map there, not to CausalLM). A
+            # quantization / OOM / device-offload error is NOT about the arch —
+            # re-raise it so the real cause surfaces instead of a misleading
+            # "Unrecognized configuration class … AutoModelForImageTextToText".
+            if "Unrecognized configuration class" not in str(e):
+                raise
+            log.warning("%s: AutoModelForCausalLM can't map this architecture (%s); "
+                        "trying AutoModelForImageTextToText.", self.label, e)
             from transformers import AutoModelForImageTextToText
-            return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
+            return _from(AutoModelForImageTextToText)
 
     # ── prompt rendering ──────────────────────────────────────────────────────
     def _apply_template(self, messages: list[dict]) -> str:

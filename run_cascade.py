@@ -98,6 +98,18 @@ def gate(rec: Record) -> tuple[Record, str | None]:
     return gated, rec.answer
 
 
+def _exc_chain(e: BaseException, limit: int = 6) -> str:
+    """Flatten an exception's cause/context chain so a wrapped import failure
+    shows its ROOT (e.g. the actual 'cannot import name …') instead of just the
+    transformers wrapper 'Could not import module …'."""
+    msgs, cur, seen = [], e, 0
+    while cur is not None and seen < limit:
+        msgs.append(f"{type(cur).__name__}: {cur}")
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    return "  <= caused by: ".join(msgs)
+
+
 def parse_stages(spec: str) -> list[str]:
     """'4b , gemma8b' → ['4b', 'gemma8b'] in canonical order, validated/deduped."""
     picked = {tok.strip().lower() for tok in spec.split(",") if tok.strip()}
@@ -248,7 +260,7 @@ def main() -> None:
         try:
             models = build_stage(specs)
         except Exception as e:  # noqa: BLE001 — a stage that won't load is skipped
-            msg = f"{type(e).__name__}: {e}"
+            msg = _exc_chain(e)
             stage_errors.append((st, msg))
             print(f"[error] stage '{st}' failed to load ({msg}); skipping its votes.")
             continue
