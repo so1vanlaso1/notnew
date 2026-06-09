@@ -52,10 +52,19 @@ Examples
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Reduce CUDA allocator fragmentation across the cascade's repeated load/unload
+# cycles. Freeing one stage can leave gaps that strand a few hundred MiB and
+# OOM-kill a right-at-the-edge next load (e.g. the 8B MoE on a ~16 GB card, which
+# died only ~224 MiB short during weight conversion). Must be set BEFORE torch /
+# CUDA initialises — hence up here, ahead of the local imports that pull torch.
+# Respect a value the user already exported.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -280,6 +289,13 @@ def main() -> None:
             msg = _exc_chain(e)
             stage_errors.append((st, msg))
             print(f"[error] stage '{st}' failed to load ({msg}); skipping its votes.")
+            if "out of memory" in msg.lower():
+                print(f"        [hint] CUDA OOM on '{st}'. Cross-stage VRAM fragmentation is "
+                      f"the usual cause (expandable_segments is already enabled). On a tight "
+                      f"GPU, give this stage the whole card by running it alone in a fresh "
+                      f"process:")
+                print(f"           python run_cascade.py --stages {st} "
+                      f"--precision {args.precision} --show-gold")
             continue
         try:
             for i, rec in enumerate(records):
